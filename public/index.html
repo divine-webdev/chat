@@ -13,6 +13,9 @@
   <script src="https://cdn.jsdelivr.net/npm/dompurify@2.4.0/dist/purify.min.js"></script>
 </head>
 <body>
+  <!-- Star layer (JS will fill this with stars; ok if empty) -->
+  <div id="stars" class="stars" aria-hidden="true"></div>
+
   <main class="container">
     <section id="hero" class="hero">
       <h1 class="title">Welcome to Divine Chat</h1>
@@ -22,7 +25,8 @@
         <button id="btnCreate" class="btn main">Create Room</button>
         <button id="btnJoin" class="btn main">Join Room</button>
         <button id="btnGlobal" class="btn main">Global Chat</button>
-        <button id="btnSettings" class="btn main outline">Settings</button>
+        <!-- Settings button is now same style as other main buttons (no outline) -->
+        <button id="btnSettings" class="btn main">Settings</button>
       </div>
     </section>
 
@@ -118,18 +122,37 @@
               </div>
             </div>
 
-            <div class="setting-row" style="flex-direction:column;align-items:stretch">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-                <div style="font-weight:700">Theme Picker</div>
-                <div style="font-size:0.85rem;color:var(--muted)">Choose a visual theme</div>
+            <div class="theme-section">
+              <!-- LIGHT row -->
+              <div class="theme-row">
+                <div class="theme-row-header">
+                  <div class="theme-row-title">Light themes</div>
+                  <div class="theme-row-hint">Bright & clean</div>
+                </div>
+                <div class="theme-picker">
+                  <button class="theme-option small" data-theme="light" data-theme-class="" title="Default Light">Light</button>
+                  <button class="theme-option" data-theme="kawaii" data-theme-class="theme-kawaii" title="Kawaii">Kawaii</button>
+                  <button class="theme-option" data-theme="sky" data-theme-class="theme-sky" title="Sky">Sky</button>
+                  <button class="theme-option" data-theme="strawberry" data-theme-class="theme-strawberry" title="Strawberry">Strawberry</button>
+                  <button class="theme-option" data-theme="mint" data-theme-class="theme-mint" title="Mint">Mint</button>
+                  <button class="theme-option" data-theme="lemon" data-theme-class="theme-lemon" title="Lemon">Lemon</button>
+                </div>
               </div>
-              <div class="theme-picker" style="margin-top:6px">
-                <button class="theme-option small" data-theme="light" data-theme-class="" title="Light">Light</button>
-                <button class="theme-option" data-theme="dark" data-theme-class="" title="Dark">Dark</button>
-                <button class="theme-option" data-theme="forest" data-theme-class="theme-forest" title="Forest">Forest</button>
-                <button class="theme-option" data-theme="amethyst" data-theme-class="theme-amethyst" title="Amethyst">Amethyst</button>
-                <button class="theme-option" data-theme="ocean" data-theme-class="theme-ocean" title="Ocean">Ocean</button>
-                <button class="theme-option" data-theme="kawaii" data-theme-class="theme-kawaii" title="Kawaii">Kawaii</button>
+
+              <!-- DARK row -->
+              <div class="theme-row">
+                <div class="theme-row-header">
+                  <div class="theme-row-title">Dark themes</div>
+                  <div class="theme-row-hint">Neon + night vibes</div>
+                </div>
+                <div class="theme-picker">
+                  <button class="theme-option" data-theme="dark" data-theme-class="" title="Default Dark">Dark</button>
+                  <button class="theme-option" data-theme="forest" data-theme-class="theme-forest" title="Forest">Forest</button>
+                  <button class="theme-option" data-theme="amethyst" data-theme-class="theme-amethyst" title="Amethyst">Amethyst</button>
+                  <button class="theme-option" data-theme="ocean" data-theme-class="theme-ocean" title="Ocean">Ocean</button>
+                  <button class="theme-option" data-theme="space" data-theme-class="theme-space" title="Space">Space</button>
+                  <button class="theme-option" data-theme="golden" data-theme-class="theme-golden" title="Golden">Golden</button>
+                </div>
               </div>
             </div>
 
@@ -148,22 +171,20 @@
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
   </main>
 
-  <!-- SVG icon definitions -->
-  <svg style="display:none" aria-hidden="true">
-    <symbol id="icon-pencil" viewBox="0 0 24 24">
-      <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
-    </symbol>
-
-    <symbol id="icon-trash" viewBox="0 0 24 24">
-      <path d="M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
-    </symbol>
-
-    <symbol id="icon-clock" viewBox="0 0 24 24">
-      <path d="M12 20a8 8 0 1 1 0-16a8 8 0 0 1 0 16zm.5-13h-1v6l5 3l.5-.86l-4.5-2.64V7z"/>
-    </symbol>
-  </svg>
-
   <script src="/socket.io/socket.io.js"></script>
   <script src="/js/main.js"></script>
+
+  <!-- Hover glow tracking for buttons -->
+  <script>
+    document.addEventListener('pointermove', (e) => {
+      const el = e.target && e.target.closest ? e.target.closest('.btn, .theme-option') : null;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const mx = ((e.clientX - r.left) / r.width) * 100;
+      const my = ((e.clientY - r.top) / r.height) * 100;
+      el.style.setProperty('--mx', mx.toFixed(2) + '%');
+      el.style.setProperty('--my', my.toFixed(2) + '%');
+    }, { passive: true });
+  </script>
 </body>
 </html>
