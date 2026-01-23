@@ -1,21 +1,17 @@
-// NOTE: This is a full replacement server.js for the "Divine Chat" style app (App B),
-// with persistence to a JSON file on a persistent disk.
+// Divine Chat server (enhanced)
+// - Persistent storage (PERSIST_PATH)
+// - Per-room identity token (authorizes edits/deletes + locked-room rejoin)
+// - Room lock/unlock (host only)
+// - Host reassignment (host only)
+// - Message IDs + edit/delete rules
+// - History cap: 100 non-system messages (tombstones count; system messages do NOT)
 //
-// Configure via ENV (you can change later without editing code):
-//   PERSIST_PATH=/var/data/chat-state.json   (recommended on a persistent disk mount)
+// ENV:
+//   PORT=3000
+//   PERSIST_PATH=/var/data/chat-state.json
 // Optional:
 //   PERSIST_INTERVAL_MS=15000
 //   PERSIST_DEBOUNCE_MS=2000
-//   PERSIST_MAX_MESSAGES=500
-//   PORT=3000
-//
-// What gets persisted:
-//   - rooms: code, passwordHash, maxUsers, messages, isGlobal, safe
-// What does NOT get persisted:
-//   - live connected users (socket ids) and typing state
-// On restart:
-//   - rooms/messages restore
-//   - users rejoin and the first user to join becomes host (ownerId) if ownerId is null
 
 const express = require('express');
 const http = require('http');
@@ -23,6 +19,7 @@ const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
@@ -37,58 +34,53 @@ app.use(express.static('public'));
 // Persistence settings
 // --------------------
 const PERSIST_PATH =
-  process.env.PERSIST_PATH ||
-  path.join(process.cwd(), 'data', 'chat-state.json'); // default local path (NOT persistent unless you mount it)
+  process.env.PERSIST_PATH || path.join(process.cwd(), 'data', 'chat-state.json');
 
 const PERSIST_INTERVAL_MS = parseInt(process.env.PERSIST_INTERVAL_MS || '15000', 10);
 const PERSIST_DEBOUNCE_MS = parseInt(process.env.PERSIST_DEBOUNCE_MS || '2000', 10);
-const PERSIST_MAX_MESSAGES = parseInt(process.env.PERSIST_MAX_MESSAGES || '500', 10);
 
-function ensureDirForFile(filePath) {
-  try {
-    const dir = path.dirname(filePath);
-    fs.mkdirSync(dir, { recursive: true });
-  } catch {
-    // ignore
-  }
-}
+// Desired history size (non-system)
+const HISTORY_MAX = 100;
 
-function safeJsonParse(raw) {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-function atomicWriteFileSync(filePath, data) {
-  // Write to temp then rename to avoid half-written JSON on crashes.
-  const dir = path.dirname(filePath);
-  const tmp = path.join(dir, `.tmp-${path.basename(filePath)}-${process.pid}-${Date.now()}`);
-  fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, filePath);
-}
+// Edit rules
+const EDIT_WINDOW_MS = 60 * 1000;
 
 // --------------------
 // In-memory room store
+// --------------------
 // room = {
 //   code,
-//   ownerId,          // socket.id (NOT persisted)
-//   passwordHash,     // persisted
-//   maxUsers,         // persisted
-//   users: { socketId: { username, joinedAt } }, // NOT persisted
-//   messages: [ { username, text, ts, type? } ], // persisted (trimmed)
-//   isGlobal: boolean, // persisted
-//   safe: boolean      // persisted
+//   ownerId,             // socket.id (NOT persisted)
+//   passwordHash,        // persisted
+//   maxUsers,            // persisted
+//   users: { socketId: { username, joinedAt, tokenId } }, // NOT persisted
+//   messages: [ Message ],                                  // persisted (non-system only)
+//   isGlobal: boolean,    // persisted
+//   safe: boolean,        // persisted
+//   locked: boolean,      // persisted
+//   tokens: { tokenId: { createdAt, lastUsername } } // persisted (per-room identity)
 // }
-// --------------------
+//
+// Message = {
+//   id: string,
+//   username: string,
+//   text: string,
+//   ts: number,
+//   type?: string,
+//   deleted?: boolean,
+//   deletedAt?: number,
+//   edited?: boolean,
+//   editedAt?: number,
+//   editedOnce?: boolean,
+//   authorTokenId?: string
+// }
 const rooms = {};
 
 // Global room key
 const GLOBAL_CODE = 'GLOBAL_CHAT_DIVINE';
 
 // --------------------
-// Sanitization helpers
+// Helpers
 // --------------------
 function sanitizeText(text) {
   if (!text) return '';
@@ -100,37 +92,113 @@ function sanitizeText(text) {
     .replace(/'/g, '&#39;');
 }
 
+function nowMs() {
+  return Date.now();
+}
+
+function genId(prefix) {
+  return `${prefix}_${crypto.randomBytes(10).toString('hex')}_${Date.now()}`;
+}
+
+function ensureDirForFile(filePath) {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  } catch {}
+}
+
+function safeJsonParse(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function atomicWriteFileSync(filePath, data) {
+  const dir = path.dirname(filePath);
+  const tmp = path.join(dir, `.tmp-${path.basename(filePath)}-${process.pid}-${Date.now()}`);
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, filePath);
+}
+
+function trimHistory(room) {
+  if (!room || !Array.isArray(room.messages)) return;
+  if (room.messages.length <= HISTORY_MAX) return;
+  room.messages = room.messages.slice(-HISTORY_MAX);
+}
+
+function buildUserList(room) {
+  const users = Object.entries(room.users || {}).map(([sid, u]) => ({
+    username: u.username,
+    socketId: sid,
+    joinedAt: u.joinedAt
+  }));
+  const ownerUsername =
+    room.ownerId && room.users && room.users[room.ownerId] ? room.users[room.ownerId].username : null;
+  return { users, ownerId: room.ownerId, ownerUsername };
+}
+
+function reassignOwnerIfNeeded(room) {
+  if (!room) return;
+
+  if (room.ownerId && room.users && room.users[room.ownerId]) return;
+
+  const sids = Object.keys(room.users || {});
+  if (sids.length === 0) {
+    if (!room.isGlobal) {
+      delete rooms[room.code];
+      markDirty();
+      console.log(`Room ${room.code} deleted because empty.`);
+    } else {
+      room.ownerId = null;
+    }
+    return;
+  }
+
+  room.ownerId = sids[0];
+  const newOwnerName = room.users[room.ownerId] ? room.users[room.ownerId].username : null;
+  io.to(room.code).emit('systemMessage', { text: `${newOwnerName || 'Someone'} is now the host.` });
+
+  const userList = buildUserList(room);
+  io.to(room.code).emit('userList', {
+    users: userList.users,
+    ownerId: userList.ownerId,
+    ownerUsername: userList.ownerUsername
+  });
+}
+
+function isHost(room, socket) {
+  return !!(room && socket && room.ownerId && room.ownerId === socket.id);
+}
+
 // --------------------
-// Persistence (load/save)
+// Persistence
 // --------------------
 let persistDirty = false;
 let persistTimer = null;
-let lastPersistOkAt = 0;
 
 function markDirty() {
   persistDirty = true;
-  // Debounce: schedule a save soon, but not on every single event.
   if (persistTimer) return;
   persistTimer = setTimeout(() => {
     persistTimer = null;
-    // We don't force save here; we call saveIfDirty which will do it.
     saveIfDirty();
   }, PERSIST_DEBOUNCE_MS);
 }
 
 function serializeRoomsForDisk() {
-  const out = { version: 1, savedAt: Date.now(), rooms: {} };
+  const out = { version: 2, savedAt: nowMs(), rooms: {} };
 
   for (const [code, room] of Object.entries(rooms)) {
-    // Persist only stable fields.
-    const messages = Array.isArray(room.messages) ? room.messages.slice(-PERSIST_MAX_MESSAGES) : [];
     out.rooms[code] = {
       code: room.code,
       passwordHash: room.passwordHash || null,
       maxUsers: typeof room.maxUsers === 'number' ? room.maxUsers : 10,
-      messages,
       isGlobal: !!room.isGlobal,
-      safe: !!room.safe
+      safe: !!room.safe,
+      locked: !!room.locked,
+      tokens: room.tokens || {},
+      messages: Array.isArray(room.messages) ? room.messages.slice(-HISTORY_MAX) : []
     };
   }
 
@@ -139,21 +207,26 @@ function serializeRoomsForDisk() {
 
 function hydrateRoomsFromDiskState(state) {
   if (!state || typeof state !== 'object') return;
-
   const stateRooms = state.rooms && typeof state.rooms === 'object' ? state.rooms : {};
+
   for (const [code, r] of Object.entries(stateRooms)) {
     if (!r || typeof r !== 'object') continue;
     const roomCode = String(r.code || code);
+
     rooms[roomCode] = {
       code: roomCode,
-      ownerId: null, // must be re-established by first join after restart
+      ownerId: null, // re-established by first join after restart
       passwordHash: r.passwordHash || null,
       maxUsers: typeof r.maxUsers === 'number' ? r.maxUsers : 10,
-      users: {}, // live only
-      messages: Array.isArray(r.messages) ? r.messages.slice(-PERSIST_MAX_MESSAGES) : [],
+      users: {},
+      messages: Array.isArray(r.messages) ? r.messages.slice(-HISTORY_MAX) : [],
       isGlobal: !!r.isGlobal,
-      safe: r.safe === undefined ? true : !!r.safe
+      safe: r.safe === undefined ? true : !!r.safe,
+      locked: !!r.locked,
+      tokens: (r.tokens && typeof r.tokens === 'object') ? r.tokens : {}
     };
+
+    trimHistory(rooms[roomCode]);
   }
 }
 
@@ -167,11 +240,12 @@ function ensureGlobalRoom() {
       users: {},
       messages: [],
       isGlobal: true,
-      safe: false
+      safe: false,
+      locked: false,
+      tokens: {}
     };
     markDirty();
   } else {
-    // Ensure global invariants
     rooms[GLOBAL_CODE].code = GLOBAL_CODE;
     rooms[GLOBAL_CODE].isGlobal = true;
     rooms[GLOBAL_CODE].safe = false;
@@ -179,21 +253,18 @@ function ensureGlobalRoom() {
     rooms[GLOBAL_CODE].maxUsers = Infinity;
     rooms[GLOBAL_CODE].users = rooms[GLOBAL_CODE].users || {};
     rooms[GLOBAL_CODE].messages = Array.isArray(rooms[GLOBAL_CODE].messages) ? rooms[GLOBAL_CODE].messages : [];
+    rooms[GLOBAL_CODE].locked = false;
+    rooms[GLOBAL_CODE].tokens = rooms[GLOBAL_CODE].tokens || {};
   }
 }
 
 function loadStateFromDisk() {
   ensureDirForFile(PERSIST_PATH);
-
   try {
-    if (!fs.existsSync(PERSIST_PATH)) {
-      // nothing to load
-      return;
-    }
+    if (!fs.existsSync(PERSIST_PATH)) return;
     const raw = fs.readFileSync(PERSIST_PATH, 'utf8');
     const parsed = safeJsonParse(raw);
     if (!parsed) return;
-
     hydrateRoomsFromDiskState(parsed);
   } catch (err) {
     console.error('Failed to load persisted state:', err);
@@ -202,84 +273,79 @@ function loadStateFromDisk() {
 
 function saveStateToDisk() {
   ensureDirForFile(PERSIST_PATH);
-
   const state = serializeRoomsForDisk();
   const json = JSON.stringify(state, null, 2);
   atomicWriteFileSync(PERSIST_PATH, json);
-  lastPersistOkAt = Date.now();
 }
 
 function saveIfDirty() {
   if (!persistDirty) return;
   try {
-    // Always trim messages before writing.
-    for (const r of Object.values(rooms)) {
-      if (Array.isArray(r.messages) && r.messages.length > PERSIST_MAX_MESSAGES) {
-        r.messages = r.messages.slice(-PERSIST_MAX_MESSAGES);
-      }
-    }
-
+    for (const r of Object.values(rooms)) trimHistory(r);
     saveStateToDisk();
     persistDirty = false;
   } catch (err) {
     console.error('Failed to persist state:', err);
-    // Leave dirty = true so we try again later.
   }
 }
 
-// Periodic flush: protects you if traffic stops before debounce fires
-setInterval(() => {
-  saveIfDirty();
-}, Math.max(2000, PERSIST_INTERVAL_MS)).unref();
+setInterval(() => saveIfDirty(), Math.max(2000, PERSIST_INTERVAL_MS)).unref();
 
-// Load persisted state at boot and ensure global room exists
 loadStateFromDisk();
 ensureGlobalRoom();
 
 // --------------------
-// Room helper functions
+// Token + permissions
 // --------------------
-function buildUserList(room) {
-  const users = Object.entries(room.users).map(([sid, u]) => ({
-    username: u.username,
-    socketId: sid,
-    joinedAt: u.joinedAt
-  }));
-  const ownerUsername =
-    room.ownerId && room.users[room.ownerId] ? room.users[room.ownerId].username : null;
-  return { users, ownerId: room.ownerId, ownerUsername };
-}
+function ensureToken(room, tokenIdMaybe, username) {
+  if (!room.tokens) room.tokens = {};
+  let tokenId = tokenIdMaybe && String(tokenIdMaybe).trim() ? String(tokenIdMaybe).trim() : null;
 
-function reassignOwnerIfNeeded(room) {
-  if (!room) return;
-
-  // If owner is missing or disconnected, pick a new owner if there are users
-  if (room.ownerId && room.users[room.ownerId]) return; // owner still present
-
-  const sids = Object.keys(room.users);
-  if (sids.length === 0) {
-    // No users; delete non-global rooms to free memory
-    if (!room.isGlobal) {
-      delete rooms[room.code];
-      markDirty();
-      console.log(`Room ${room.code} deleted because empty.`);
-    } else {
-      room.ownerId = null;
-    }
-    return;
+  if (!tokenId) {
+    tokenId = genId('t');
+    room.tokens[tokenId] = { createdAt: nowMs(), lastUsername: username || '' };
+    markDirty();
+    return tokenId;
   }
 
-  // pick first user as new owner
-  room.ownerId = sids[0];
-  const newOwnerName = room.users[room.ownerId] ? room.users[room.ownerId].username : null;
-  io.to(room.code).emit('systemMessage', { text: `${newOwnerName || 'Someone'} is now the host.` });
+  if (!room.tokens[tokenId]) {
+    room.tokens[tokenId] = { createdAt: nowMs(), lastUsername: username || '' };
+    markDirty();
+    return tokenId;
+  }
 
-  const userList = buildUserList(room);
-  io.to(room.code).emit('userList', {
-    users: userList.users,
-    ownerId: userList.ownerId,
-    ownerUsername: userList.ownerUsername
-  });
+  room.tokens[tokenId].lastUsername = username || room.tokens[tokenId].lastUsername || '';
+  markDirty();
+  return tokenId;
+}
+
+function canEditMessage(room, socket, msg) {
+  if (!room || !socket || !msg) return { ok: false, reason: 'Invalid.' };
+  if (msg.deleted) return { ok: false, reason: 'Message already deleted.' };
+  if (msg.editedOnce) return { ok: false, reason: 'Message already edited once.' };
+
+  const tokenId = socket.data.tokenId;
+  if (!tokenId || msg.authorTokenId !== tokenId) return { ok: false, reason: 'Not your message.' };
+
+  const age = nowMs() - (msg.ts || 0);
+  if (age > EDIT_WINDOW_MS) return { ok: false, reason: 'Edit window expired.' };
+
+  // Option 1: once you send any new message, you cannot edit older ones.
+  const cutoff = socket.data.lastSentMessageTs || 0;
+  if (cutoff && msg.ts < cutoff) return { ok: false, reason: 'You already sent another message.' };
+
+  return { ok: true };
+}
+
+function canDeleteMessage(room, socket, msg) {
+  if (!room || !socket || !msg) return { ok: false, reason: 'Invalid.' };
+  if (msg.deleted) return { ok: false, reason: 'Already deleted.' };
+
+  const tokenId = socket.data.tokenId;
+  const isSender = tokenId && msg.authorTokenId === tokenId;
+  if (isSender) return { ok: true };
+  if (isHost(room, socket)) return { ok: true };
+  return { ok: false, reason: 'No permission.' };
 }
 
 // --------------------
@@ -288,12 +354,13 @@ function reassignOwnerIfNeeded(room) {
 io.on('connection', (socket) => {
   socket.data.currentRoom = null;
   socket.data.username = null;
+  socket.data.tokenId = null;
   socket.data.lastMessageTs = 0;
+  socket.data.lastSentMessageTs = 0;
 
-  // Create a room
   socket.on('createRoom', async (payload, cb) => {
     try {
-      const { username, code, password, maxUsers, safe } = payload || {};
+      const { username, code, password, maxUsers, safe, tokenId } = payload || {};
       if (!username || !code) return cb && cb({ ok: false, message: 'Username and code required.' });
 
       const key = String(code).trim();
@@ -313,27 +380,32 @@ io.on('connection', (socket) => {
         users: {},
         messages: [],
         isGlobal: false,
-        safe: safe === undefined ? true : !!safe
+        safe: safe === undefined ? true : !!safe,
+        locked: false,
+        tokens: {}
       };
 
-      // Add creator to room
       const safeName = sanitizeText(username);
-      rooms[key].users[socket.id] = { username: safeName, joinedAt: Date.now() };
+      const assignedTokenId = ensureToken(rooms[key], tokenId, safeName);
+
+      rooms[key].users[socket.id] = { username: safeName, joinedAt: nowMs(), tokenId: assignedTokenId };
       socket.join(key);
       socket.data.currentRoom = key;
       socket.data.username = safeName;
+      socket.data.tokenId = assignedTokenId;
+      socket.data.lastSentMessageTs = 0;
 
       const userList = buildUserList(rooms[key]);
 
-      cb &&
-        cb({
-          ok: true,
-          room: { code: key, maxUsers: finalMax, isGlobal: false, safe: rooms[key].safe },
-          messages: rooms[key].messages,
-          users: userList.users,
-          ownerId: userList.ownerId,
-          ownerUsername: userList.ownerUsername
-        });
+      cb && cb({
+        ok: true,
+        room: { code: key, maxUsers: finalMax, isGlobal: false, safe: rooms[key].safe, locked: rooms[key].locked },
+        messages: rooms[key].messages,
+        users: userList.users,
+        ownerId: userList.ownerId,
+        ownerUsername: userList.ownerUsername,
+        tokenId: assignedTokenId
+      });
 
       io.to(key).emit('userList', {
         users: userList.users,
@@ -348,19 +420,28 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Join a room
   socket.on('joinRoom', async (payload, cb) => {
     try {
-      const { username, code, password } = payload || {};
+      const { username, code, password, tokenId } = payload || {};
       if (!username || !code) return cb && cb({ ok: false, message: 'Username and code required.' });
 
       const key = String(code).trim();
       const room = rooms[key];
       if (!room) return cb && cb({ ok: false, message: 'Room not found.' });
 
+      const safeName = sanitizeText(username);
+
+      // Locked-room rule: ONLY users with an existing token for this room may join.
+      if (!room.isGlobal && room.locked) {
+        const incomingToken = tokenId && String(tokenId).trim() ? String(tokenId).trim() : '';
+        if (!incomingToken || !room.tokens || !room.tokens[incomingToken]) {
+          return cb && cb({ ok: false, message: 'Room locked.' });
+        }
+      }
+
       // username uniqueness (case-insensitive)
-      const unameLower = String(username).trim().toLowerCase();
-      const nameTaken = Object.values(room.users).some(
+      const unameLower = String(safeName).trim().toLowerCase();
+      const nameTaken = Object.values(room.users || {}).some(
         (u) => (u.username || '').toLowerCase() === unameLower
       );
       if (nameTaken) return cb && cb({ ok: false, message: 'Username already taken in this room.' });
@@ -370,16 +451,18 @@ io.on('connection', (socket) => {
         if (!ok) return cb && cb({ ok: false, message: 'Incorrect password.' });
       }
 
-      const userCount = Object.keys(room.users).length;
+      const userCount = Object.keys(room.users || {}).length;
       if (userCount >= room.maxUsers) return cb && cb({ ok: false, message: 'Room is full.' });
 
-      const safeName = sanitizeText(username);
-      room.users[socket.id] = { username: safeName, joinedAt: Date.now() };
+      const assignedTokenId = ensureToken(room, tokenId, safeName);
+
+      room.users[socket.id] = { username: safeName, joinedAt: nowMs(), tokenId: assignedTokenId };
       socket.join(key);
       socket.data.currentRoom = key;
       socket.data.username = safeName;
+      socket.data.tokenId = assignedTokenId;
+      socket.data.lastSentMessageTs = 0;
 
-      // If room was restored from disk, ownerId is null; set first joiner as owner.
       if (!room.isGlobal && !room.ownerId) {
         room.ownerId = socket.id;
         io.to(key).emit('systemMessage', { text: `${safeName} is now the host.` });
@@ -387,27 +470,23 @@ io.on('connection', (socket) => {
 
       const userList = buildUserList(room);
 
-      cb &&
-        cb({
-          ok: true,
-          room: { code: key, maxUsers: room.maxUsers, isGlobal: room.isGlobal, safe: room.safe },
-          messages: room.messages,
-          users: userList.users,
-          ownerId: userList.ownerId,
-          ownerUsername: userList.ownerUsername
-        });
+      cb && cb({
+        ok: true,
+        room: { code: key, maxUsers: room.maxUsers, isGlobal: room.isGlobal, safe: room.safe, locked: room.locked },
+        messages: room.messages,
+        users: userList.users,
+        ownerId: userList.ownerId,
+        ownerUsername: userList.ownerUsername,
+        tokenId: assignedTokenId
+      });
 
       io.to(key).emit('userList', {
         users: userList.users,
         ownerId: userList.ownerId,
         ownerUsername: userList.ownerUsername
       });
-
       io.to(key).emit('systemMessage', { text: `${safeName} joined the room.` });
 
-      // You can choose whether join/leave messages should persist; if you want them to persist,
-      // you'd store system messages in room.messages too. For now, we only persist actual chat messages.
-      // markDirty is still useful because room ownership might have changed.
       markDirty();
     } catch (err) {
       console.error(err);
@@ -415,42 +494,42 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Join global (convenience)
   socket.on('joinGlobal', (payload, cb) => {
     try {
       const { username } = payload || {};
       if (!username) return cb && cb({ ok: false, message: 'Username required.' });
 
+      ensureGlobalRoom();
       const room = rooms[GLOBAL_CODE];
-      if (!room) {
-        ensureGlobalRoom();
-      }
 
-      const globalRoom = rooms[GLOBAL_CODE];
+      const safeName = sanitizeText(username);
 
-      const unameLower = String(username).trim().toLowerCase();
-      const nameTaken = Object.values(globalRoom.users).some(
+      const unameLower = String(safeName).trim().toLowerCase();
+      const nameTaken = Object.values(room.users || {}).some(
         (u) => (u.username || '').toLowerCase() === unameLower
       );
       if (nameTaken) return cb && cb({ ok: false, message: 'Username already taken in global chat.' });
 
-      const safeName = sanitizeText(username);
-      globalRoom.users[socket.id] = { username: safeName, joinedAt: Date.now() };
+      const assignedTokenId = ensureToken(room, null, safeName);
+
+      room.users[socket.id] = { username: safeName, joinedAt: nowMs(), tokenId: assignedTokenId };
       socket.join(GLOBAL_CODE);
       socket.data.currentRoom = GLOBAL_CODE;
       socket.data.username = safeName;
+      socket.data.tokenId = assignedTokenId;
+      socket.data.lastSentMessageTs = 0;
 
-      const userList = buildUserList(globalRoom);
+      const userList = buildUserList(room);
 
-      cb &&
-        cb({
-          ok: true,
-          room: { code: GLOBAL_CODE, isGlobal: true, safe: globalRoom.safe },
-          messages: globalRoom.messages,
-          users: userList.users,
-          ownerId: userList.ownerId,
-          ownerUsername: userList.ownerUsername
-        });
+      cb && cb({
+        ok: true,
+        room: { code: GLOBAL_CODE, isGlobal: true, safe: room.safe, locked: room.locked },
+        messages: room.messages,
+        users: userList.users,
+        ownerId: userList.ownerId,
+        ownerUsername: userList.ownerUsername,
+        tokenId: assignedTokenId
+      });
 
       io.to(GLOBAL_CODE).emit('userList', {
         users: userList.users,
@@ -466,17 +545,17 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Send message
   socket.on('sendMessage', (payload, cb) => {
     try {
       const { text, type } = payload || {};
       const roomKey = socket.data.currentRoom;
       const username = socket.data.username || 'Unknown';
+      const tokenId = socket.data.tokenId || null;
 
       if (!roomKey) return cb && cb({ ok: false, message: 'Not in a room.' });
       if (!text || !String(text).trim()) return cb && cb({ ok: false, message: 'Empty message.' });
 
-      const now = Date.now();
+      const now = nowMs();
       if (now - socket.data.lastMessageTs < 200) {
         return cb && cb({ ok: false, message: 'You are sending messages too quickly.' });
       }
@@ -486,13 +565,57 @@ io.on('connection', (socket) => {
       if (!room) return cb && cb({ ok: false, message: 'Room not found.' });
 
       const safeText = sanitizeText(String(text).slice(0, 2000));
-      const msg = { username, text: safeText, ts: now };
+      const msg = {
+        id: genId('m'),
+        username,
+        text: safeText,
+        ts: now,
+        authorTokenId: tokenId
+      };
       if (type) msg.type = String(type);
 
       room.messages.push(msg);
-      if (room.messages.length > PERSIST_MAX_MESSAGES) room.messages.shift();
+      trimHistory(room);
+
+      // Option 1: sending any new message ends edit ability for all older ones (per socket session)
+      socket.data.lastSentMessageTs = now;
 
       io.to(roomKey).emit('newMessage', msg);
+      cb && cb({ ok: true, message: msg });
+
+      markDirty();
+    } catch (err) {
+      console.error(err);
+      cb && cb({ ok: false, message: 'Server error' });
+    }
+  });
+
+  socket.on('editMessage', (payload, cb) => {
+    try {
+      const { messageId, newText } = payload || {};
+      const roomKey = socket.data.currentRoom;
+      if (!roomKey) return cb && cb({ ok: false, message: 'Not in a room.' });
+
+      const room = rooms[roomKey];
+      if (!room) return cb && cb({ ok: false, message: 'Room not found.' });
+
+      if (!messageId) return cb && cb({ ok: false, message: 'Missing message id.' });
+
+      const msg = (room.messages || []).find((m) => m && m.id === messageId);
+      if (!msg) return cb && cb({ ok: false, message: 'Message not found.' });
+
+      const allowed = canEditMessage(room, socket, msg);
+      if (!allowed.ok) return cb && cb({ ok: false, message: allowed.reason || 'Cannot edit.' });
+
+      const safeText = sanitizeText(String(newText || '').slice(0, 2000));
+      if (!safeText.trim()) return cb && cb({ ok: false, message: 'Empty message.' });
+
+      msg.text = safeText;
+      msg.edited = true;
+      msg.editedAt = nowMs();
+      msg.editedOnce = true;
+
+      io.to(roomKey).emit('messageEdited', { id: msg.id, text: msg.text, editedAt: msg.editedAt });
       cb && cb({ ok: true });
 
       markDirty();
@@ -502,7 +625,96 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Typing indicator (simple broadcast to room)
+  socket.on('deleteMessage', (payload, cb) => {
+    try {
+      const { messageId } = payload || {};
+      const roomKey = socket.data.currentRoom;
+      if (!roomKey) return cb && cb({ ok: false, message: 'Not in a room.' });
+
+      const room = rooms[roomKey];
+      if (!room) return cb && cb({ ok: false, message: 'Room not found.' });
+
+      if (!messageId) return cb && cb({ ok: false, message: 'Missing message id.' });
+
+      const msg = (room.messages || []).find((m) => m && m.id === messageId);
+      if (!msg) return cb && cb({ ok: false, message: 'Message not found.' });
+
+      const allowed = canDeleteMessage(room, socket, msg);
+      if (!allowed.ok) return cb && cb({ ok: false, message: allowed.reason || 'Cannot delete.' });
+
+      msg.text = 'Message deleted';
+      msg.deleted = true;
+      msg.deletedAt = nowMs();
+
+      io.to(roomKey).emit('messageDeleted', { id: msg.id, deletedAt: msg.deletedAt });
+      cb && cb({ ok: true });
+
+      markDirty();
+    } catch (err) {
+      console.error(err);
+      cb && cb({ ok: false, message: 'Server error' });
+    }
+  });
+
+  socket.on('setRoomLocked', (payload, cb) => {
+    try {
+      const { locked } = payload || {};
+      const roomKey = socket.data.currentRoom;
+      if (!roomKey) return cb && cb({ ok: false, message: 'Not in a room.' });
+
+      const room = rooms[roomKey];
+      if (!room) return cb && cb({ ok: false, message: 'Room not found.' });
+      if (room.isGlobal) return cb && cb({ ok: false, message: 'Global chat cannot be locked.' });
+      if (!isHost(room, socket)) return cb && cb({ ok: false, message: 'Only host can lock/unlock.' });
+
+      room.locked = !!locked;
+
+      io.to(roomKey).emit('roomLockedChanged', { locked: room.locked });
+      io.to(roomKey).emit('systemMessage', { text: room.locked ? 'Room locked.' : 'Room unlocked.' });
+
+      cb && cb({ ok: true, locked: room.locked });
+      markDirty();
+    } catch (err) {
+      console.error(err);
+      cb && cb({ ok: false, message: 'Server error' });
+    }
+  });
+
+  socket.on('reassignHost', (payload, cb) => {
+    try {
+      const { targetSocketId } = payload || {};
+      const roomKey = socket.data.currentRoom;
+      if (!roomKey) return cb && cb({ ok: false, message: 'Not in a room.' });
+
+      const room = rooms[roomKey];
+      if (!room) return cb && cb({ ok: false, message: 'Room not found.' });
+      if (room.isGlobal) return cb && cb({ ok: false, message: 'Global chat has no host.' });
+      if (!isHost(room, socket)) return cb && cb({ ok: false, message: 'Only host can reassign.' });
+
+      if (!targetSocketId || !room.users || !room.users[targetSocketId]) {
+        return cb && cb({ ok: false, message: 'Target user not found in room.' });
+      }
+
+      room.ownerId = targetSocketId;
+
+      const newOwnerName = room.users[targetSocketId] ? room.users[targetSocketId].username : 'Someone';
+      io.to(roomKey).emit('systemMessage', { text: `${newOwnerName} is now the host.` });
+
+      const userList = buildUserList(room);
+      io.to(roomKey).emit('userList', {
+        users: userList.users,
+        ownerId: userList.ownerId,
+        ownerUsername: userList.ownerUsername
+      });
+
+    cb && cb({ ok: true });
+      markDirty();
+    } catch (err) {
+      console.error(err);
+      cb && cb({ ok: false, message: 'Server error' });
+    }
+  });
+
   socket.on('typing', (payload) => {
     try {
       const roomKey = socket.data.currentRoom;
@@ -510,12 +722,9 @@ io.on('connection', (socket) => {
       const username = socket.data.username || 'Unknown';
       const typing = !!(payload && payload.typing);
       socket.to(roomKey).emit('typing', { username, socketId: socket.id, typing });
-    } catch {
-      // ignore
-    }
+    } catch {}
   });
 
-  // Host clear chat
   socket.on('clearRoom', (payload, cb) => {
     try {
       const roomKey = socket.data.currentRoom;
@@ -524,9 +733,7 @@ io.on('connection', (socket) => {
       const room = rooms[roomKey];
       if (!room) return cb && cb({ ok: false, message: 'Room not found.' });
       if (room.isGlobal) return cb && cb({ ok: false, message: 'Cannot clear global chat.' });
-      if (room.ownerId !== socket.id) {
-        return cb && cb({ ok: false, message: 'Only the host can clear the chat.' });
-      }
+      if (!isHost(room, socket)) return cb && cb({ ok: false, message: 'Only the host can clear the chat.' });
 
       room.messages = [];
       io.to(roomKey).emit('roomCleared', { by: socket.data.username || 'host' });
@@ -539,7 +746,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Client explicitly signals refresh/kill action (private rooms only)
   socket.on('client-refresh', () => {
     try {
       const roomKey = socket.data.currentRoom;
@@ -548,11 +754,9 @@ io.on('connection', (socket) => {
       const room = rooms[roomKey];
       if (!room || room.isGlobal) return;
 
-      // Only delete room if it's a safe room
       if (room.safe) {
         io.to(roomKey).emit('kicked', { reason: 'Room closed due to page refresh (safe room).' });
 
-        // Remove users from room and close it
         const socketsToLeave = Object.keys(room.users || {});
         socketsToLeave.forEach((sid) => {
           const s = io.sockets.sockets.get(sid);
@@ -582,7 +786,6 @@ io.on('connection', (socket) => {
       socket.data.currentRoom = null;
       return;
     }
-
     delete room.users[socket.id];
     socket.leave(roomKey);
     socket.data.currentRoom = null;
@@ -598,7 +801,6 @@ io.on('connection', (socket) => {
       });
     }
 
-    // If room got deleted, reassignOwnerIfNeeded already handled it.
     markDirty();
   });
 
@@ -622,12 +824,11 @@ io.on('connection', (socket) => {
       });
     }
 
-    // Don’t delete room on disconnect; deletion happens when empty in reassignOwnerIfNeeded
     markDirty();
   });
 });
 
-// Best-effort flush on shutdown (platform may SIGTERM on deploy)
+// Best-effort flush on shutdown
 function shutdownHandler(signal) {
   try {
     console.log(`Received ${signal}. Flushing persistence...`);
@@ -641,7 +842,4 @@ process.on('SIGTERM', () => shutdownHandler('SIGTERM'));
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
   console.log(`Persistence path: ${PERSIST_PATH}`);
-  console.log(
-    `Persistence: interval=${PERSIST_INTERVAL_MS}ms debounce=${PERSIST_DEBOUNCE_MS}ms maxMessages=${PERSIST_MAX_MESSAGES} lastOk=${lastPersistOkAt}`
-  );
 });
