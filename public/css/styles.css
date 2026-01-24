@@ -76,8 +76,8 @@ body.light-mode {
 
 /* UPDATED: Forest (dark green bg + tree-stump brown buttons) */
 .theme-forest {
-  --bg-900: #041106;
-  --bg-800: #06210c;
+  --bg-900: #136620;
+  --bg-800: #074514;
   --panel: rgba(255,255,255,0.03);
   --panel-strong: rgba(255,255,255,0.05);
   --panel-border: rgba(255,255,255,0.08);
@@ -98,8 +98,8 @@ body.light-mode {
 
 /* UPDATED: Amethyst (dark purple bg + medium-light purple buttons) */
 .theme-amethyst {
-  --bg-900: #120018;
-  --bg-800: #1b0026;
+  --bg-900: #44157a;
+  --bg-800: #2c104d;
 
   --panel: rgba(255,255,255,0.02);
   --panel-strong: rgba(255,255,255,0.04);
@@ -122,8 +122,8 @@ body.light-mode {
 
 /* UPDATED: Ocean (deep blue bg + medium-light blue buttons) */
 .theme-ocean {
-  --bg-900: #02061a;
-  --bg-800: #031a33;
+  --bg-900: #0f216e;
+  --bg-800: #151f4a;
 
   --panel: rgba(255,255,255,0.02);
   --panel-strong: rgba(255,255,255,0.04);
@@ -163,8 +163,8 @@ body.light-mode {
 
 /* UPDATED: Golden (dark gold bg + light gold buttons) */
 .theme-golden{
-  --bg-900: #140e06;
-  --bg-800: #221707;
+  --bg-900: #6e580a;
+  --bg-800: #473907;
 
   --panel: rgba(255,255,255,0.03);
   --panel-strong: rgba(255,255,255,0.05);
